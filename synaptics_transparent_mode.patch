@@ -1,0 +1,328 @@
+diff --git a/drivers/input/mouse/psmouse-base.c b/drivers/input/mouse/psmouse-base.c
+index a0aac76b1..3cc39076a 100644
+--- a/drivers/input/mouse/psmouse-base.c
++++ b/drivers/input/mouse/psmouse-base.c
+@@ -368,6 +368,7 @@ static enum ps2_disposition psmouse_pre_receive_byte(struct ps2dev *ps2dev,
+ static void psmouse_receive_byte(struct ps2dev *ps2dev, u8 data)
+ {
+ 	struct psmouse *psmouse = container_of(ps2dev, struct psmouse, ps2dev);
++	struct psmouse *parent_psmouse = NULL;
+ 
+ 	pm_wakeup_event(&ps2dev->serio->dev, 0);
+ 
+@@ -397,7 +398,16 @@ static void psmouse_receive_byte(struct ps2dev *ps2dev, u8 data)
+ 		    (psmouse->protocol->type == PSMOUSE_HGPK &&
+ 		     psmouse->packet[1] == PSMOUSE_RET_BAT)) {
+ 			__psmouse_set_state(psmouse, PSMOUSE_IGNORE);
+-			serio_reconnect(ps2dev->serio);
++			/* Reactivate transparent mode */
++			if (ps2dev->serio->parent)
++				parent_psmouse = serio_get_drvdata(ps2dev->serio->parent);
++			if (ps2dev->serio->id.type == SERIO_PS_PSTHRU &&
++			    parent_psmouse &&
++			    (parent_psmouse->protocol->type == PSMOUSE_SYNAPTICS || parent_psmouse->protocol->type == PSMOUSE_SYNAPTICS_RELATIVE) &&
++			    ((struct synaptics_data *)parent_psmouse->private)->transparent_mode)
++				serio_reconnect(ps2dev->serio->parent);
++			else
++				serio_reconnect(ps2dev->serio);
+ 			return;
+ 		}
+ 
+diff --git a/drivers/input/mouse/synaptics.c b/drivers/input/mouse/synaptics.c
+index ada299ec5..bec407de9 100644
+--- a/drivers/input/mouse/synaptics.c
++++ b/drivers/input/mouse/synaptics.c
+@@ -507,6 +507,12 @@ static const struct min_max_quirk min_max_pnpid_table[] = {
+ 	{ }
+ };
+ 
++
++static bool synaptics_ps2_transparent_mode = false;
++module_param_named(synaptics_ps2_transparent_mode, synaptics_ps2_transparent_mode, bool, 0644);
++MODULE_PARM_DESC(synaptics_ps2_transparent_mode, "Enable transparent pass-through mode from PS2 guest to host.");
++
++
+ /*****************************************************************************
+  *	Synaptics communications functions
+  ****************************************************************************/
+@@ -626,12 +632,43 @@ static void synaptics_set_rate(struct psmouse *psmouse, unsigned int rate)
+ /*****************************************************************************
+  *	Synaptics pass-through PS/2 port support
+  ****************************************************************************/
++static int synaptics_enter_transparent_mode(struct psmouse *psmouse)
++{
++	struct synaptics_data *priv = psmouse->private;
++
++	priv->mode |= SYN_BIT_TRANSPARENT_MODE;
++
++	if (synaptics_mode_cmd(psmouse, priv->mode))
++		return -EIO;
++
++	return 0;
++}
++
++static int synaptics_exit_transparent_mode(struct psmouse *psmouse)
++{
++	struct synaptics_data *priv = psmouse->private;
++
++	/* send scaling 2:1, 1:1 to exit transparent mode */
++	if (ps2_command(&psmouse->ps2dev, NULL, 0x00e7))
++		return -EIO;
++	if (ps2_command(&psmouse->ps2dev, NULL, 0x00e6))
++		return -EIO;
++
++	priv->mode &= ~SYN_BIT_TRANSPARENT_MODE;
++
++	return 0;
++}
++
+ static int synaptics_pt_write(struct serio *serio, u8 c)
+ {
+ 	struct psmouse *parent = psmouse_from_serio(serio->parent);
++	struct synaptics_data *priv = parent->private;
+ 	u8 rate_param = SYN_PS_CLIENT_CMD; /* indicates that we want pass-through port */
+ 	int error;
+ 
++	if (priv->transparent_mode)
++		return parent->ps2dev.serio->write(parent->ps2dev.serio, c);
++
+ 	error = ps2_sliced_command(&parent->ps2dev, c);
+ 	if (error)
+ 		return error;
+@@ -643,6 +680,8 @@ static int synaptics_pt_write(struct serio *serio, u8 c)
+ 	return 0;
+ }
+ 
++static void synaptics_update_protocol_handler(struct psmouse *psmouse);
++
+ static int synaptics_pt_start(struct serio *serio)
+ {
+ 	struct psmouse *parent = psmouse_from_serio(serio->parent);
+@@ -652,6 +691,8 @@ static int synaptics_pt_start(struct serio *serio)
+ 	priv->pt_port = serio;
+ 	serio_continue_rx(parent->ps2dev.serio);
+ 
++	synaptics_update_protocol_handler(parent);
++
+ 	return 0;
+ }
+ 
+@@ -663,6 +704,8 @@ static void synaptics_pt_stop(struct serio *serio)
+ 	serio_pause_rx(parent->ps2dev.serio);
+ 	priv->pt_port = NULL;
+ 	serio_continue_rx(parent->ps2dev.serio);
++
++	synaptics_update_protocol_handler(parent);
+ }
+ 
+ static int synaptics_is_pt_packet(u8 *buf)
+@@ -690,6 +733,10 @@ static void synaptics_pt_activate(struct psmouse *psmouse)
+ 	struct synaptics_data *priv = psmouse->private;
+ 	struct psmouse *child = psmouse_from_serio(priv->pt_port);
+ 
++	/* don't need change mode if transparent mode is active */
++	if (priv->transparent_mode)
++		return;
++
+ 	/* adjust the touchpad to child's choice of protocol */
+ 	if (child) {
+ 		if (child->pktsize == 4)
+@@ -1229,6 +1276,17 @@ static psmouse_ret_t synaptics_process_byte(struct psmouse *psmouse)
+ 		PSMOUSE_GOOD_DATA : PSMOUSE_BAD_DATA;
+ }
+ 
++static psmouse_ret_t transparent_process_byte(struct psmouse *psmouse)
++{
++	struct synaptics_data *priv = psmouse->private;
++
++	if (!priv->pt_port)
++		return PSMOUSE_BAD_DATA;
++
++	serio_interrupt(priv->pt_port, psmouse->packet[psmouse->pktcnt - 1], 0);
++	return PSMOUSE_FULL_PACKET;
++}
++
+ /*****************************************************************************
+  *	Driver initialization/cleanup functions
+  ****************************************************************************/
+@@ -1401,6 +1459,52 @@ PSMOUSE_DEFINE_ATTR(disable_gesture, S_IWUSR | S_IRUGO, NULL,
+ 		    synaptics_show_disable_gesture,
+ 		    synaptics_set_disable_gesture);
+ 
++static ssize_t synaptics_show_transparent_mode(struct psmouse *psmouse,
++					      void *data, char *buf)
++{
++	struct synaptics_data *priv = psmouse->private;
++
++	return sprintf(buf, "%c\n", priv->transparent_mode ? '1' : '0');
++}
++
++static ssize_t synaptics_set_transparent_mode(struct psmouse *psmouse,
++					     void *data, const char *buf,
++					     size_t len)
++{
++	struct synaptics_data *priv = psmouse->private;
++	unsigned int value;
++	int err;
++
++	err = kstrtouint(buf, 10, &value);
++	if (err)
++		return err;
++
++	if (value > 1)
++		return -EINVAL;
++
++	if (value == priv->transparent_mode)
++		return len;
++
++	priv->transparent_mode = value;
++
++	synaptics_update_protocol_handler(psmouse);
++
++	if (value) {
++		if (synaptics_enter_transparent_mode(psmouse))
++			return -EIO;
++	}
++	else {
++		if (synaptics_exit_transparent_mode(psmouse))
++			return -EIO;
++	}
++
++	return len;
++}
++
++PSMOUSE_DEFINE_ATTR(transparent_mode, S_IWUSR | S_IRUGO, NULL,
++		    synaptics_show_transparent_mode,
++		    synaptics_set_transparent_mode);
++
+ static void synaptics_disconnect(struct psmouse *psmouse)
+ {
+ 	struct synaptics_data *priv = psmouse->private;
+@@ -1411,10 +1515,16 @@ static void synaptics_disconnect(struct psmouse *psmouse)
+ 	 */
+ 	psmouse_smbus_cleanup(psmouse);
+ 
++	if (priv->transparent_mode)
++		synaptics_exit_transparent_mode(psmouse);
++
+ 	if (!priv->absolute_mode &&
+ 			SYN_ID_DISGEST_SUPPORTED(priv->info.identity))
+ 		device_remove_file(&psmouse->ps2dev.serio->dev,
+ 				   &psmouse_attr_disable_gesture.dattr);
++	if (SYN_CAP_PASS_THROUGH(priv->info.capabilities))
++		device_remove_file(&psmouse->ps2dev.serio->dev,
++				   &psmouse_attr_transparent_mode.dattr);
+ 
+ 	synaptics_reset(psmouse);
+ 	kfree(priv);
+@@ -1441,8 +1551,17 @@ static int synaptics_reconnect(struct psmouse *psmouse)
+ 			 */
+ 			ssleep(1);
+ 		}
+-		ps2_command(&psmouse->ps2dev, param, PSMOUSE_CMD_GETID);
+-		error = synaptics_detect(psmouse, 0);
++		if (priv->transparent_mode) {
++			error = synaptics_enter_transparent_mode(psmouse);
++			if (!error) {
++				serio_reconnect(priv->pt_port);
++				return 0;
++			}
++		}
++		else {
++			ps2_command(&psmouse->ps2dev, param, PSMOUSE_CMD_GETID);
++			error = synaptics_detect(psmouse, 0);
++		}
+ 	} while (error && ++retry < 3);
+ 
+ 	if (error)
+@@ -1553,6 +1672,29 @@ void __init synaptics_module_init(void)
+ 	cr48_profile_sensor = dmi_check_system(cr48_dmi_table);
+ }
+ 
++static void synaptics_update_protocol_handler(struct psmouse *psmouse)
++{
++	struct synaptics_data *priv = psmouse->private;
++	struct serio *pt_port = priv->pt_port;
++
++	bool absolute_mode = priv->absolute_mode;
++	bool transparent_mode = priv->transparent_mode;
++
++	if (transparent_mode && pt_port) {
++		psmouse->protocol_handler = transparent_process_byte;
++	}
++	else {
++		if (absolute_mode) {
++			psmouse->protocol_handler = synaptics_process_byte;
++			psmouse->pktsize = 6;
++		} else {
++			/* Relative mode follows standard PS/2 mouse protocol */
++			psmouse->protocol_handler = psmouse_process_byte;
++			psmouse->pktsize = 3;
++		}
++	}
++}
++
+ static int synaptics_init_ps2(struct psmouse *psmouse,
+ 			      struct synaptics_device_info *info,
+ 			      bool absolute_mode)
+@@ -1611,14 +1753,7 @@ static int synaptics_init_ps2(struct psmouse *psmouse,
+ 	psmouse->model = ((info->model_id & 0x00ff0000) >> 8) |
+ 			  (info->model_id & 0x000000ff);
+ 
+-	if (absolute_mode) {
+-		psmouse->protocol_handler = synaptics_process_byte;
+-		psmouse->pktsize = 6;
+-	} else {
+-		/* Relative mode follows standard PS/2 mouse protocol */
+-		psmouse->protocol_handler = psmouse_process_byte;
+-		psmouse->pktsize = 3;
+-	}
++	synaptics_update_protocol_handler(psmouse);
+ 
+ 	psmouse->set_rate = synaptics_set_rate;
+ 	psmouse->disconnect = synaptics_disconnect;
+@@ -1653,6 +1788,24 @@ static int synaptics_init_ps2(struct psmouse *psmouse,
+ 		}
+ 	}
+ 
++	if (SYN_CAP_PASS_THROUGH(info->capabilities)) {
++		err = device_create_file(&psmouse->ps2dev.serio->dev,
++					 &psmouse_attr_transparent_mode.dattr);
++		if (err) {
++			psmouse_err(psmouse,
++				    "Failed to create transparent_mode attribute (%d)",
++				    err);
++			goto init_fail;
++		}
++
++		if (synaptics_ps2_transparent_mode) {
++			priv->transparent_mode = true;
++			synaptics_update_protocol_handler(psmouse);
++			synaptics_enter_transparent_mode(psmouse);
++		}
++	}
++
++
+ 	return 0;
+ 
+  init_fail:
+diff --git a/drivers/input/mouse/synaptics.h b/drivers/input/mouse/synaptics.h
+index 08533d1b1..a6a50ac5b 100644
+--- a/drivers/input/mouse/synaptics.h
++++ b/drivers/input/mouse/synaptics.h
+@@ -24,6 +24,7 @@
+ /* synatics modes */
+ #define SYN_BIT_ABSOLUTE_MODE		BIT(7)
+ #define SYN_BIT_HIGH_RATE		BIT(6)
++#define SYN_BIT_TRANSPARENT_MODE	BIT(5)
+ #define SYN_BIT_SLEEP_MODE		BIT(3)
+ #define SYN_BIT_DISABLE_GESTURE		BIT(2)
+ #define SYN_BIT_FOUR_BYTE_CLIENT	BIT(1)
+@@ -186,6 +187,7 @@ struct synaptics_data {
+ 
+ 	bool absolute_mode;			/* run in Absolute mode */
+ 	bool disable_gesture;			/* disable gestures */
++	bool transparent_mode;			/* pass packets directly from guest */
+ 
+ 	struct serio *pt_port;			/* Pass-through serio port */
+ 
